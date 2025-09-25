@@ -1,6 +1,6 @@
 module github.com/dhruv304c2/ai-guru-be.git
 
-go 1.25.1
+go 1.25.0
 
 require (
 	cloud.google.com/go v0.116.0 // indirect

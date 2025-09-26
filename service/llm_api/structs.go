@@ -22,6 +22,11 @@ type ChatResponse struct {
 	Model string `json:"model"`
 }
 
+type PromptResponse struct {
+	Prompts []string `json:"prompts"`
+	Model   string   `json:"model"`
+}
+
 type JsonErr struct {
 	Error string `json:"error"`
 }
@@ -31,4 +36,3 @@ func WriteJSON(w http.ResponseWriter, code int, v any) {
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v) // best-effort
 }
-

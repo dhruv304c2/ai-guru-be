@@ -19,6 +19,13 @@ Your role is to serve seekers in the modern world by making this timeless wisdom
 Guidelines:
 1) Assess first, 2) Adapt teaching, 3) Śāstrārtha, 4) Bridge old & new, 5) Compassionate, crisp, authoritative tone, 6) Mission: clarity & transformation, 7) Keep responses crisp.`
 
+const generatePromptSeed = `Based on the conversation so far and the last user message, generate a list of short possible user prompts/questions the user might want to ask next.
+- Keep each prompt under 10 words.
+- Respond with a raw JSON array of strings, for example: ["Question 1", "Question 2"].
+- The first character of your response must be '[' and the last must be ']'.
+- Output must be valid JSON without backticks, code fences, markdown, or commentary.
+- If no prompts apply, respond with [].`
+
 // ---------------------------
 // Shared helpers (single parser + content builder)
 // ---------------------------
@@ -65,6 +72,40 @@ func buildContents(req ChatRequest) (contents []*genai.Content, model string) {
 			})
 		}
 	}
+	if msg := strings.TrimSpace(req.Message); msg != "" {
+		contents = append(contents, &genai.Content{
+			Role:  genai.RoleUser,
+			Parts: []*genai.Part{{Text: msg}},
+		})
+	}
+
+	model = req.Model
+	if model == "" {
+		model = "gemini-2.5-flash"
+	}
+	return contents, model
+}
+
+func buildContentsForPrompt(req ChatRequest) (contents []*genai.Content, model string) {
+	contents = append(contents, &genai.Content{
+		Role:  genai.RoleUser,
+		Parts: []*genai.Part{{Text: defaultSeed}},
+	})
+
+	for _, m := range req.History {
+		if s := strings.TrimSpace(m.Content); s != "" {
+			contents = append(contents, &genai.Content{
+				Role:  toGenAIRole(m.Role),
+				Parts: []*genai.Part{{Text: s}},
+			})
+		}
+	}
+
+	contents = append(contents, &genai.Content{
+		Role:  genai.RoleUser,
+		Parts: []*genai.Part{{Text: generatePromptSeed}},
+	})
+
 	if msg := strings.TrimSpace(req.Message); msg != "" {
 		contents = append(contents, &genai.Content{
 			Role:  genai.RoleUser,
@@ -139,6 +180,57 @@ func ChatHandler(client *genai.Client) http.HandlerFunc {
 	}
 }
 
+func GenerateUserPromptHandler(client *genai.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		req, err := decodeChatRequest(w, r)
+		if err != nil {
+			status := http.StatusBadRequest
+			switch {
+			case err.Error() == "method not allowed":
+				status = http.StatusMethodNotAllowed
+			case strings.Contains(err.Error(), "Content-Type"):
+				status = http.StatusUnsupportedMediaType
+			}
+			WriteJSON(w, status, JsonErr{err.Error()})
+			return
+		}
+
+		content, model := buildContentsForPrompt(req)
+
+		// Tie to request and bound time
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+
+		res, err := client.Models.GenerateContent(ctx, model, content, nil)
+		if err != nil {
+			WriteJSON(w, http.StatusBadGateway, JsonErr{"model error: " + err.Error()})
+			return
+		}
+		if res == nil {
+			log.Printf("llm chat: nil response from model %q", model)
+			WriteJSON(w, http.StatusBadGateway, JsonErr{"model error: empty response"})
+			return
+		}
+
+		raw := strings.TrimSpace(res.Text())
+
+		var prompts []string
+		if raw != "" {
+			if err := json.Unmarshal([]byte(raw), &prompts); err != nil {
+				log.Printf("prompt handler: unable to parse response as JSON array: %v", err)
+			}
+		}
+		if prompts == nil {
+			prompts = []string{}
+		}
+
+		WriteJSON(w, http.StatusOK, PromptResponse{
+			Prompts: prompts,
+			Model:   model,
+		})
+	}
+}
+
 // ---------------------------
 // Streaming handler (SSE)
 // ---------------------------
@@ -147,13 +239,21 @@ func ChatStreamHandler(client *genai.Client) http.HandlerFunc {
 
 	writeSSE := func(w http.ResponseWriter, event, data string) error {
 		if event != "" {
-			if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil { return err }
+			if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil {
+				return err
+			}
 		}
 		for _, line := range strings.Split(data, "\n") {
-			if _, err := fmt.Fprintf(w, "data: %s\n", line); err != nil { return err }
+			if _, err := fmt.Fprintf(w, "data: %s\n", line); err != nil {
+				return err
+			}
 		}
-		if _, err := fmt.Fprint(w, "\n"); err != nil { return err }
-		if f, ok := w.(flusher); ok { f.Flush() }
+		if _, err := fmt.Fprint(w, "\n"); err != nil {
+			return err
+		}
+		if f, ok := w.(flusher); ok {
+			f.Flush()
+		}
 		return nil
 	}
 
@@ -203,9 +303,13 @@ func ChatStreamHandler(client *genai.Client) http.HandlerFunc {
 				continue
 			}
 			for _, cand := range resp.Candidates {
-				if cand == nil || cand.Content == nil { continue }
+				if cand == nil || cand.Content == nil {
+					continue
+				}
 				for _, part := range cand.Content.Parts {
-					if part == nil || part.Text == "" { continue }
+					if part == nil || part.Text == "" {
+						continue
+					}
 					full.WriteString(part.Text)
 					if err := writeSSE(w, "partial", fmt.Sprintf(`{"part":%q}`, part.Text)); err != nil {
 						log.Printf("llm chat stream write error: %v", err) // client likely disconnected
@@ -220,7 +324,6 @@ func ChatStreamHandler(client *genai.Client) http.HandlerFunc {
 	}
 }
 
-
 // Your existing role mapper (kept as-is)
 func toGenAIRole(s string) string {
 	switch strings.ToLower(s) {
@@ -232,4 +335,3 @@ func toGenAIRole(s string) string {
 		return genai.RoleUser
 	}
 }
-

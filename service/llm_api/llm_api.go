@@ -3,6 +3,8 @@ package llmApi
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"mime"
 	"net/http"
@@ -17,82 +19,86 @@ Your role is to serve seekers in the modern world by making this timeless wisdom
 Guidelines:
 1) Assess first, 2) Adapt teaching, 3) Śāstrārtha, 4) Bridge old & new, 5) Compassionate, crisp, authoritative tone, 6) Mission: clarity & transformation, 7) Keep responses crisp.`
 
-func toGenAIRole(s string) string {
-	switch strings.ToLower(s) {
-	case "assistant", "model", "ai":
-		return genai.RoleModel
-	case "system":
-		return genai.RoleUser
-	default:
-		return genai.RoleUser
+// ---------------------------
+// Shared helpers (single parser + content builder)
+// ---------------------------
+
+func decodeChatRequest(w http.ResponseWriter, r *http.Request) (ChatRequest, error) {
+	var req ChatRequest
+
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		return req, errors.New("method not allowed")
 	}
+
+	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if ct != "application/json" {
+		return req, errors.New("Content-Type must be application/json")
+	}
+
+	// Limit payload to 1 MiB
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	defer r.Body.Close()
+
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		return req, errors.New("invalid JSON: " + err.Error())
+	}
+	if strings.TrimSpace(req.Message) == "" && len(req.History) == 0 {
+		return req, errors.New("message required (or history/seed)")
+	}
+	return req, nil
 }
+
+func buildContents(req ChatRequest) (contents []*genai.Content, model string) {
+	contents = append(contents, &genai.Content{
+		Role:  genai.RoleUser,
+		Parts: []*genai.Part{{Text: defaultSeed}},
+	})
+
+	for _, m := range req.History {
+		if s := strings.TrimSpace(m.Content); s != "" {
+			contents = append(contents, &genai.Content{
+				Role:  toGenAIRole(m.Role),
+				Parts: []*genai.Part{{Text: s}},
+			})
+		}
+	}
+	if msg := strings.TrimSpace(req.Message); msg != "" {
+		contents = append(contents, &genai.Content{
+			Role:  genai.RoleUser,
+			Parts: []*genai.Part{{Text: msg}},
+		})
+	}
+
+	model = req.Model
+	if model == "" {
+		model = "gemini-2.5-flash"
+	}
+	return contents, model
+}
+
+// ---------------------------
+// Existing non-stream handler
+// ---------------------------
 
 func ChatHandler(client *genai.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.Header().Set("Allow", http.MethodPost)
-			WriteJSON(w, http.StatusMethodNotAllowed, JsonErr{"method not allowed"})
-			return
-		}
-
-		// Accept application/json or application/json; charset=utf-8
-		ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
-		if ct != "application/json" {
-			WriteJSON(w, http.StatusUnsupportedMediaType, JsonErr{"Content-Type must be application/json"})
-			return
-		}
-
-		// Limit payload to 1 MiB
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		defer r.Body.Close()
-
-		var req ChatRequest
-		dec := json.NewDecoder(r.Body)
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil {
-			WriteJSON(w, http.StatusBadRequest, JsonErr{"invalid JSON: " + err.Error()})
-			return
-		}
-		if strings.TrimSpace(req.Message) == "" && len(req.History) == 0 && strings.TrimSpace(req.Seed) == "" {
-			WriteJSON(w, http.StatusBadRequest, JsonErr{"message required (or history/seed)"})
-			return
-		}
-
-		// Build conversation
-		var content []*genai.Content
-
-		seed := strings.TrimSpace(req.Seed)
-		if seed == "" && len(req.History) == 0 {
-			seed = defaultSeed
-		}
-		if seed != "" {
-			content = append(content, &genai.Content{
-				Role:  genai.RoleUser, // seed as user instruction
-				Parts: []*genai.Part{{Text: seed}},
-			})
-		}
-
-		for _, m := range req.History {
-			if s := strings.TrimSpace(m.Content); s != "" {
-				content = append(content, &genai.Content{
-					Role:  toGenAIRole(m.Role),
-					Parts: []*genai.Part{{Text: s}},
-				})
+		req, err := decodeChatRequest(w, r)
+		if err != nil {
+			status := http.StatusBadRequest
+			switch {
+			case err.Error() == "method not allowed":
+				status = http.StatusMethodNotAllowed
+			case strings.Contains(err.Error(), "Content-Type"):
+				status = http.StatusUnsupportedMediaType
 			}
+			WriteJSON(w, status, JsonErr{err.Error()})
+			return
 		}
 
-		if msg := strings.TrimSpace(req.Message); msg != "" {
-			content = append(content, &genai.Content{
-				Role:  genai.RoleUser,
-				Parts: []*genai.Part{{Text: msg}},
-			})
-		}
-
-		model := req.Model
-		if model == "" {
-			model = "gemini-2.5-flash"
-		}
+		content, model := buildContents(req)
 
 		// Tie to request and bound time
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
@@ -111,7 +117,7 @@ func ChatHandler(client *genai.Client) http.HandlerFunc {
 
 		reply := strings.TrimSpace(res.Text())
 		if reply == "" {
-			// Never return a blank body: surface an explicit note
+			// Never return a blank body
 			WriteJSON(w, http.StatusOK, struct {
 				Reply string `json:"reply"`
 				Model string `json:"model"`
@@ -132,3 +138,98 @@ func ChatHandler(client *genai.Client) http.HandlerFunc {
 		})
 	}
 }
+
+// ---------------------------
+// Streaming handler (SSE)
+// ---------------------------
+func ChatStreamHandler(client *genai.Client) http.HandlerFunc {
+	type flusher interface{ Flush() }
+
+	writeSSE := func(w http.ResponseWriter, event, data string) error {
+		if event != "" {
+			if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil { return err }
+		}
+		for _, line := range strings.Split(data, "\n") {
+			if _, err := fmt.Fprintf(w, "data: %s\n", line); err != nil { return err }
+		}
+		if _, err := fmt.Fprint(w, "\n"); err != nil { return err }
+		if f, ok := w.(flusher); ok { f.Flush() }
+		return nil
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		req, err := decodeChatRequest(w, r)
+		if err != nil {
+			status := http.StatusBadRequest
+			switch {
+			case err.Error() == "method not allowed":
+				status = http.StatusMethodNotAllowed
+			case strings.Contains(err.Error(), "Content-Type"):
+				status = http.StatusUnsupportedMediaType
+			}
+			WriteJSON(w, status, JsonErr{err.Error()})
+			return
+		}
+
+		contents, model := buildContents(req)
+
+		// SSE headers
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache, no-transform")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no") // helps with nginx
+
+		if _, ok := w.(flusher); !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		_ = writeSSE(w, "start", fmt.Sprintf(`{"model":%q}`, model))
+
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+		defer cancel()
+
+		it := client.Models.GenerateContentStream(ctx, model, contents, nil)
+
+		var full strings.Builder
+
+		for resp, err := range it {
+			if err != nil {
+				_ = writeSSE(w, "error", fmt.Sprintf(`{"error":%q}`, "model error: "+err.Error()))
+				_ = writeSSE(w, "done", "{}")
+				return
+			}
+			if resp == nil {
+				continue
+			}
+			for _, cand := range resp.Candidates {
+				if cand == nil || cand.Content == nil { continue }
+				for _, part := range cand.Content.Parts {
+					if part == nil || part.Text == "" { continue }
+					full.WriteString(part.Text)
+					if err := writeSSE(w, "partial", fmt.Sprintf(`{"part":%q}`, part.Text)); err != nil {
+						log.Printf("llm chat stream write error: %v", err) // client likely disconnected
+						return
+					}
+				}
+			}
+		}
+
+		_ = writeSSE(w, "complete", fmt.Sprintf(`{"reply":%q,"model":%q}`, full.String(), model))
+		_ = writeSSE(w, "done", "{}")
+	}
+}
+
+
+// Your existing role mapper (kept as-is)
+func toGenAIRole(s string) string {
+	switch strings.ToLower(s) {
+	case "assistant", "model", "ai":
+		return genai.RoleModel
+	case "system":
+		return genai.RoleUser
+	default:
+		return genai.RoleUser
+	}
+}
+

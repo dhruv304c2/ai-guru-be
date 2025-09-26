@@ -14,7 +14,6 @@ type Message struct {
 type ChatRequest struct {
 	Message string    `json:"message"`           // required (unless you only send history)
 	History []Message `json:"history,omitempty"` // prior turns
-	Seed    string    `json:"seed,omitempty"`    // optional, defaults to Guru seed if empty and no history
 	Model   string    `json:"model,omitempty"`   // optional, defaults to gemini-2.5-flash
 }
 

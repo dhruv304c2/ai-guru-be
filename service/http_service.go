@@ -41,6 +41,7 @@ func Start(addr string) error {
 	//Handlers
 	mux.HandleFunc("/llm/chat", llmApi.ChatHandler(client))
 	mux.HandleFunc("/llm/chat/partial", llmApi.ChatStreamHandler(client))
+	mux.HandleFunc("/llm/chat/suggestions", llmApi.GenerateUserPromptHandler(client))
 
 	server := &http.Server{
 		Addr:         addr,
